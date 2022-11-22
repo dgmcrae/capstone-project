@@ -1,0 +1,576 @@
+---
+title: "Political Bias of Newspapers"
+author: "Dave McRae"
+date: '2022-11-22'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(quanteda)) install.packages("quanteda", repos = "http://cran.us.r-project.org")
+if(!require(quanteda.textstats)) install.packages("quanteda.textstats", repos = "http://cran.us.r-project.org")
+if(!require(quanteda.textmodels)) install.packages("quanteda.textmodels", repos = "http://cran.us.r-project.org")
+if(!require(quanteda.textplots)) install.packages("quanteda.textplots", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(RColorBrewer)) install.packages("RColorBrewer", repos = "http://cran.us.r-project.org")
+if(!require(sentimentr)) install.packages("sentimentr", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(naivebayes)) install.packages("naivebayes", repos = "http://cran.us.r-project.org")
+if(!require(kernlab)) install.packages("kernlab", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(RColorBrewer)) install.packages("RColorBrewer", repos = "http://cran.us.r-project.org")
+if(!require(readxl)) install.packages("readxl", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textmodels)
+library(quanteda.textplots)
+library(spacyr)
+library(readxl)
+library(data.table)
+library(lubridate)
+library(RColorBrewer)
+library(sentimentr)
+library(caret)
+library(naivebayes)
+library(kernlab)
+library(kableExtra)
+library(RColorBrewer)
+library(readxl)
+
+# Read in data files
+analysis_df <- readRDS("data/analysis_df_2022-11-22.rds")
+parsed_ndf_entities_named <- readRDS("data/parsed_ndf_entities_named_2022-11-22.rds")
+ndf_entities_names_count10_coded <- 
+  readxl::read_xlsx("data/ndf_entities_names_count10_coded.xlsx")
+
+## Generate a train and test set
+set.seed(22, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(22)`
+test_index <- createDataPartition(y = as.factor(analysis_df$publication), times = 1, p = 0.1, list = FALSE)
+analysis_train_full <- analysis_df[-test_index,]
+analysis_test <- analysis_df[test_index,]
+
+## Repeat the process to obtain a probe set for model testing
+set.seed(23, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(22)`
+test_index1 <- createDataPartition(y = as.factor(analysis_train_full$publication), times = 1, p = 0.1, list = FALSE)
+analysis_probe <- analysis_train_full[test_index1,]
+analysis_train <- analysis_train_full[-test_index1,]
+
+# Create lists of doc ids for train, test, probe, train_full to subset dfms
+# Method to assign variable name: bit.ly/3XiF0Xb
+# Method to use string as variable name: bit.ly/3GxcuLh
+sets <- c("train", "probe", "test", "train_full")
+for(i in 1:length(sets)){
+  assign(paste(sets[i], "_doc_ids", sep = ""), eval(as.name(paste("analysis_", sets[i], sep = ""))) %>% pull(doc_id))
+}
+
+#Set colour scheme for figures
+pub_colours <- brewer.pal(n = 5, name = "Set2")
+
+```
+
+## Executive Summary and Introduction
+
+This report presents an attempt to undertake supervised classification of newspaper articles covering the 2022 Australian Federal election using measures of their political bias to identify each article's publication outlet. To simplify the classification task, we define bias as coverage favouring either the Australian Labor Party (ALP) or its main opponent the Coalition (a grouping of the Liberal Party and the National Party), disregarding minor parties and independent candidates. We assemble a dataset of 1001 newspaper articles published during the election campaign period from 5 media outlets, which satisfy the additional condition that every article must contain at least 10 sentences that mention a political party, a party member or a candidate from these two political groupings. 
+
+As we lack resources to undertake manual coding of bias, we exclusively use computational measures, namely the average sentiment per article of sentences discussing the ALP and the Coalition, the average sentiment of the headlines of these articles, and full text classification using sentences that discuss the ALP and/or the Coalition. Classification employs three algorithms suited to multi-class classification: Support Vector machine, Naive Bayes and K-Nearest Neighbours.
+
+We set the performance benchmark for these algorithms to be the prevalence of the most frequently occurring publication outlet in our train set, which is _The Australian_ at `r round(analysis_train %>% group_by(publication) %>% summarise(proportion = n()/nrow(analysis_train)) %>% filter(publication == "The Australian") %>% pull(proportion), digits = 3)*100`%, which Kuhn and Johnson (2016) term the 'no information rate'.  Using our most direct measure of political bias, only the K-Nearest Neighbours method exceeds the no information rate, and only modestly so. Visualisation of sentiment-based bias measures explains this modest performance, as with the exception of a few outliers, there is little separation between classes. SVM and Naive Bayes algorithms trained on the full text sentences mentioning the ALP and the Coalition perform better at classification, but we cannot demonstrate unequivocally that this classification relies on a measure of bias. Nevertheless, the SVM algorithm in particular performs very well on the political sentence text, achieving accuracy of 66.7%.  
+
+These results leave us with an ambiguous conclusion - it is clearly possible to use machine learning techniques on the text of articles discussing the federal election to identify their publication outlet, but we remain unsure whether this classification reflects differing biases. It may be that perceptions of distinctive political bias on the part of these media outlets are overstated. Equally, though, a combination of manual coding and computational measures may be needed to generate better features to enable classification based on political bias.
+
+## Background
+There is a widespread perception that different print media outlets in Australia have different political orientations (Gans and Leigh 2012). Such bias, if present, may variously reflect the politics of the media's owners, their editors and journalists, or their intended readership. Table 1 summarises the presumed ideological bias of five major print media outlets in Victoria, Australia's second most populous state and the author's place of residence.^[I describe these outlets as print media/newspapers, because they produce written text articles. _ABC News_, however, is the online-only print arm of the public broadcaster _ABC_, which also operates a television station and radio. _The Guardian - Australia_ is an online-only news website operating as the Australian edition of _The Guardian_.]
+
+```{r}
+media <- tibble(Newspaper = c("ABC News", "The Age", "The Australian", "The Guardian - Australia", "Herald Sun"),
+                 Owner = c("Public Broadcaster", "Nine Media", 
+                 "News Corp", "Guardian Media Group", 
+                 "News Corp"),
+                 Ideology = c("Centre Left", "Centre Right", "Right", "Left", "Right"))
+                 
+media %>% kbl(caption = "Presumed ideological positioning of media outlets", col.names = c("Publication", "Owner", "Ideology")) %>%  kable_paper("hover", full_width = F) %>% kable_styling(latex_options = "HOLD_position")
+```
+Perceived media bias is particularly contentious during election campaigns. News Corp-owned outlets in particular have fielded accusations of hostility to the Australian Labor Party (ALP), with former ALP Prime Minister Kevin Rudd petitioning in 2020 for a royal commission to investigate News Corp's attacks on its political opponents.^[https://www.aph.gov.au/e-petitions/petition/EN1938]  In this report, we seek to investigate political bias on the part of Victoria's print media during the 2022 Australian federal election campaign. We confine our investigation of bias to Australia's main political cleavage, between the left-wing ALP and the right-of-centre Coalition, a grouping of the Liberal Party and the rural-based National Party. The Coalition lost government to the ALP in this 2022 election: the ALP won 77 of 151 seats in the House of Representatives, the Coalition 58 seats, with minor parties and independent candidates winning the remaining 16 seats. Our chosen method is machine learning, specifically supervised classification. In plain terms, we investigate whether we can train an algorithm to predict which outlet an article was published in, based on measures of political bias of the article's text.   
+
+This report comprises four sections. In this initial section, we introduce our dataset of media articles and the measures of political bias we employ. Next, a methods section explains our approach to supervised classification. Third, a results section presents the outcomes of our tuning of our classification model parameters and the accuracy of our classification outcomes. Finally, in conclusion, we offer some brief observations on the effectiveness of this approach and possibilities for further enhancement.
+
+We assemble our dataset for this report through an API query to obtain Guardian Australia articles, and a keyword search of the Factiva database for the remaining four publications. In each case we use "election" as our keyword, and collect articles published from Sunday 10 April - the day then Prime Minister Scott Morrison announced the election - until Friday 20 May - the day prior to polling day. After initial data-cleaning to remove duplicate articles, articles with fewer than 100 words, and live blog articles, we obtain an initial dataset of 3090 articles.^[Articles with fewer than 100 words are presumed too short to classify. Live blogs are removed because of an inconsistency in how different publications post live blogs to databases. Some publications post them as individual articles of fewer than 100 words, whereas others aggregate all live blog posts for the day into a single article. We delete this latter category of posts for consistency across publications.]
+
+Our approach to generating measures of bias relies in part in identifying sentences within these articles that discuss the ALP or the Coalition. We estimate a minimum of ten such sentences are required for us to be able to classify each article. This threshold also serves to eliminate a proportion of articles that contain the keyword "election" but do not in fact discuss federal politics. Manual examination of the initial dataset found our "election" search query had captured many articles discussing other topics that make only offhand mention of the federal election, or which discuss state politics or elections in other countries.  We thus employ the SpacyR package to divide each article into constituent sentences and to extract so-called entities (names of people or organisations) from the text. SpacyR - which provides an R wrapper to the Python package Spacy - was preferred to alternative R package suchs as quanteda, because the authors of the two packages describe SpacyR as providing smarter tokenisation.^[https://spacyr.quanteda.io/articles/using_spacyr.html]
+
+After manual coding of relevant entities as either ALP-aligned or Coalition-aligned, 1001 articles remain that include at least ten sentences we can identify as discussing the ALP or the Coalition (Table 2). Entities were preferred to keywords or specific n-grams (e.g. bigrams or trigrams) because they both eliminate the ambiguity inherent in single word keywords and allow flexibility in the length of the string of words used to detect relevant sentences. As an example of the ambiguity problem of keywords, "Andrews" could denote either Coalition government Home Affairs Minister Karen Andrews (relevant) or Victorian State Premier Daniel Andrews (irrelevant). 
+
+```{r publication table}
+publications_summary <- analysis_df %>% count(publication, sort = TRUE)
+
+publications_summary %>% kbl(caption = "Articles from each media outlet in dataset", col.names = c("Publication", "No of articles")) %>%  kable_paper("hover", full_width = F) %>% kable_styling(latex_options = "HOLD_position")
+```
+
+The following table shows the most frequently occurring ALP and Coalition entities.^[We insert the "_" during entity extraction, these are not present in the original document.] For the ALP< we see different forms of the party name, different forms of party leader and now prime minister Anthony Albanese's name, his deputy Jim Chalmers, Albanese's predecessor as party leader Bill Shorten, and former prime minister Kevin Rudd. For the Coalition, half of the top ten entities are different forms of party names, with the remainder being different forms of then prime minister Scott Morrison's name, then treasurer Josh Frydenberg's name, as well as former Coalition prime minister John Howard.  
+```{r most common entities}
+alp_entities <-  ndf_entities_names_count10_coded %>% filter(alp_entities == 1) %>% pull(entity)
+coalition_entities <-  ndf_entities_names_count10_coded %>% filter(coalition_entities == 1) %>% pull(entity)
+
+alp_cols <- parsed_ndf_entities_named %>% filter(entity %in% alp_entities) %>% count(entity, sort = TRUE) %>% slice_head(n=10)
+colnames(alp_cols) <- c("alp_entity", "alp_n")
+
+coalition_cols <- parsed_ndf_entities_named %>% filter(entity %in% coalition_entities) %>% count(entity, sort = TRUE) %>% slice_head(n=10)
+colnames(coalition_cols) <- c("coalition_entity", "coalition_n")
+
+top_entities <- bind_cols(alp_cols, coalition_cols)
+
+top_entities %>% kbl(caption = "Most frequently occurring ALP and Coalition Entities", col.names = c("Alp Entities", "No", "Coalition Entities", "No")) %>%  kable_paper("hover", full_width = F) %>% kable_styling(latex_options = "HOLD_position")
+```
+
+## Methods
+
+We choose overall accuracy as our metric to evaluate model success. Accuracy is a suitable measure as there is no imbalance in importance between false positives and false negatives, as would be the case in disease detection for example.^[Kuhn and Johnson 2016, p. 255] Kuhn and Johnson (2016, p. 255) propose using a 'no information rate' equal to the frequency in the training set of the largest class as a minimum benchmark for model adequacy. If we can achieve greater than 36% accuracy in classification using justifiable measures of political bias, therefore, we will conclude the publications are distinguished by differing political bias to more than a negligible extent.
+
+Our stages of analysis are as follows:
+
+1. We partition the 1001 articles in our dataset into a 90 percent train set and 10 percent test set, and then repeat the partition just on the train set to obtain a 81% train set and 9% probe set. The test set is set aside for final testing only of our chosen classification model.
+
+2. We first investigate the feasibility of classification by publication outlet using a Naive Bayes and a Support Vector Machine algorithm on the full text of the articles in our dataset. These two algorithms are implemented in the quanteda.textmodels package as textmodel_nb and textmodel_svm.^[https://github.com/quanteda/quanteda.textmodels The package provides a tutorial on the requirements to implement these models, using the Naive Bayes model as an example: https://tutorials.quanteda.io/machine-learning/nb/] For Naive Bayes, we run two versions of the model: an unadjusted model that assumes all classes are equally distributed, and a model tuned with the "prior" parameter to adjust predictions based on the actual prevalence of each publication in our train set. Each operates on a quanteda document frequency matrix (dfm), a data object that records the frequency of individual words in each document and the dataset as a whole, irrespective of word order. Stopwords and punctuation are removed prior to generating the dfm; so too are urls and a list of keywords corresponding to the publication names, lest our models use these to classify the articles. The 'bag of words' approach is not a measure of political bias, but a result above the 'no information rate' would demonstrate that classification of the articles based on some measure derived from their text is possible.
+
+3. We next attempt classification by the first (and most direct) of our political bias measures, the sentiment of sentences discussing the ALP and the Coalition respectively. We first calculate sentiment per sentence using the sentimentR package,^[https://cran.r-project.org/web/packages/sentimentr/index.html] preferred because it takes account of negators when calculating sentiment (Naldi 2019). For classification, we prepare three sets of sentiment scores for each document in the dataset:
+
+    i) Average sentiment of sentences mentioning ALP and mentioning Coalition in each document - sentences mentioning both sides are included in the calculation of both averages. As our prediction algorithms cannot handle missing values, if a document does not discuss one side, its score is set as 0.
+    ii) A date-adjusted average of sentences mentioning ALP and mentioning Coalition in each document - we divide the dataset into weekly date bins, calculate the weekly average of the sentiment scores in (i), and then generate a date-adjusted sentiment scores for each document calculated as:
+        date-adjusted ALP sentiment score = (average ALP sentiment score of all documents published the same week) - (document's ALP sentimente score). This measure aims to capture media who are outliers from time-dependent trends in sentiment during the campaign (e.g a publication that maintained positive reportage about the ALP when other publications were running negative coverage of a campaign development.)
+    iii) A combination of both the raw and date-adjusted sentence sentiment scores
+    
+We then use three algorithms suited to multi-class classification on these sentiment scores: Naive Bayes, Support Vector Machine, and K Nearest Neighbours. We implement all of these algorithms using the Caret package,^[https://cran.r-project.org/web/packages/caret/vignettes/caret.html] using the "svmLinear", "naive_bayes" and "knn" methods respectively. We specify the following tuning of these models:
+
+  i) For the Support Vector Machine, we tune the cost parameter, trying values between 0.1 and 1 in 0.1 increments.^[Originally we trialled 0 to 1, but 0 throws up erro messages as no support vectors are found.] 
+  ii) For K Nearest Neighbours, we tune the values of k. We anticipate the optimum value will be the odd number closest to the square root of the number of documents in our training set^[https://towardsdatascience.com/how-to-find-the-optimal-value-of-k-in-knn-35d936e554eb] - `r round(sqrt(nrow(analysis_train)), digits = 1)` - and consequently trial odd numbers ranging from 5 to 31. 
+  iii) For Naive Bayes, we do not use Laplace smoothing, but try the kernel set as True and False respectively, and try adjust values between 0.5 and 5 in 0.5 increments.
+
+4. We next include a less direct measure of political bias - the sentiment of the headlines of the articles.  We again use the same classification algorithms with the same range of tuning paramaters as for the sentiment of sentences, training these algorithms on the sentiment scores for the headlines in combination with the raw sentence sentiment scores.
+
+5. We then proceed to our final - and least direct - measure of political bias is to perform full text classification on the sentences that we have identified as discussing the ALP and the Coalition. We produce three different datasets by collapsing all of the political sentences from each document into a single text:
+
+    i) ALP corpus - only the sentences coded as mentioning the ALP are included
+    ii) Coalition corpus - only the sentences coded as mentioning the Coalition are included
+    iii) Political sentences corpus - all sentences coded either as mentioning the ALP and the Coalition are included.
+    
+We first again use the quanteda.textmodels package to perform Naive Bayes and SVM classification on this text, to maximise comparability with our full article text measures. The authors of quanteda.textmodels have implemented these algorithms in a way tailored to the fast and accurate classifcation of text, when compared to more generic implementations available through the Caret package.^[See answer by Kenneth Benoit on this point in this Stack Overflow post: https://stackoverflow.com/questions/54427001/naive-bayes-in-quanteda-vs-caret-wildly-different-results] For our purposes, however, a key limitation of quanteda.textmodels package is that it lacks a method to extract the most important features the algorithms have used to classify the articles, which might enable us to make a judgment on how directly this classification derives from political bias.^[See https://github.com/quanteda/quanteda.textmodels/issues/10 for a user request for this feature]
+
+6. We train our best performing model on the full train set and test it on the previously set aside test set. As this model employs an indirect measure of political bias, we also use keyness frequency from the quanteda.textstats^[https://cran.r-project.org/web/packages/quanteda.textstats/index.html] and quanteda.textplots^[https://cran.r-project.org/web/packages/quanteda.textplots/index.html] packages to attempt to approximate the features that may be contributing to classification to check for their relevance to bias.
+
+
+## Results
+```{r classification using article full text, echo=FALSE}
+
+## We first create a dfm from the full text of the articles,
+## removing stopwords, punctuation and keywords related to the names
+## of the publication outlets that our algorithms might use in classification
+
+pub_names <- c("ABC", "abc", "Herald", "herald", "Sun", "sun", 
+               "Age", "age", "Australian", "australian", "Guardian", "guardian")
+
+analysis_dfm <- corpus(analysis_df$clean_text, 
+                       docnames = analysis_df$doc_id, 
+                       docvars = data.frame(publication = analysis_df$publication)) %>% #create corpus
+  tokens(., remove_punct = TRUE) %>%  # tokenise to individual words; remove punctuation
+  tokens_select(., pattern = stopwords("en"), 
+              selection = "remove", padding = TRUE) %>% # remove stopwords
+  tokens_select(., pattern = pub_names, 
+              selection = "remove", padding = TRUE) %>% # remove pub name keywords
+  dfm() #create dfm
+
+## We now subset analysis_dfm into train and probe. 
+## name of dfm is dfm_ at/p_ (analysis_train/probe) ns (no stopwords)
+dfm_at_ns <- analysis_dfm %>% dfm_subset(., docnames(analysis_dfm) %in% train_doc_ids)
+dfm_ap_ns <- analysis_dfm %>% dfm_subset(., docnames(analysis_dfm) %in% probe_doc_ids)
+
+## Pre-machine learning data processing - Use only features in train set,
+## (for bigger datasets could set trim to greater number than 1)
+## then padding probe set plus removing features not in train
+dfm_at_ns <- dfm_at_ns %>% dfm_trim(1)
+dfm_ap_ns <- dfm_match(dfm_ap_ns, featnames(dfm_at_ns))
+
+### Full text Naive Bayes model implemented using quanteda.textmodels ###
+set.seed(25, sample.kind = "Rounding")
+ft_nb_model <- textmodel_nb(dfm_at_ns, docvars(dfm_at_ns,
+                                            "publication"))
+
+# we also test a model which takes into account document frequency, as we have unbalanced numbers of 
+# the classes we are seeking to classify
+ft_nb_priors_model <- textmodel_nb(dfm_at_ns, docvars(dfm_at_ns,
+                                                   "publication"), prior = "docfreq")
+
+# predictions for unadjusted and adjusted based on document frequency
+test_predictions_ft_nb <- predict(ft_nb_model,
+                            newdata=dfm_ap_ns)
+
+test_predictions_ft_nb_priors <- predict(ft_nb_priors_model,
+                                    newdata=dfm_ap_ns)
+
+# Calculate accuracy for Naive Bayes classification
+
+full_text_nb_accuracy <- confusionMatrix(as.factor(docvars(dfm_ap_ns,"publication")),
+                                         as.factor(test_predictions_ft_nb))$overall["Accuracy"]
+
+# setting priors makes little difference, 
+# potentially because the proportion in the probe set is very similar to the train set
+full_text_nb_priors_accuracy <- confusionMatrix(as.factor(docvars(dfm_ap_ns,"publication")),
+                                                as.factor(test_predictions_ft_nb_priors))$overall["Accuracy"]
+
+### Full text Support Vector Machine model implemented using quanteda.textmodels ###
+set.seed(25, sample.kind = "Rounding")
+ft_svm_model <-  textmodel_svm(dfm_at_ns, docvars(dfm_at_ns, "publication"))
+
+test_predictions_ft_svm <- predict(ft_svm_model,
+                                newdata=dfm_ap_ns)
+
+## Calculate accuracy metric for this classification effort
+
+full_text_svm_accuracy <- confusionMatrix(as.factor(docvars(dfm_ap_ns,"publication")),
+                                          as.factor(test_predictions_ft_svm))$overall["Accuracy"]
+
+
+```
+
+
+### Full text classification
+As detailed in methods, we train a Support Vector Machine and a Naive Bayes algorithm on the full text of our train set articles, and use these models to classify the probe set. Both models perform well beyond the 'no information rate'. The SVM model achieves an accuracy of `r round(full_text_svm_accuracy, digits = 3)*100`% on the probe set. Naive Bayes performs less well, but is still well above the 'no information rate threshold', both when used unadjusted at `r round(full_text_nb_accuracy, digits = 3)*100`% and when adjusted to take account of the prevalence of publication outlets in our dataset, at `r round(full_text_nb_priors_accuracy, digits = 3)*100`% accuracy. Note that in both cases we apply these algorithms only after removing publication names and URLs from the bag of words - the SVM performed significantly better and Naive Bayes a little bit worse before these features were removed, suggesting that the algorithms were making use of them in their classification prior to their removal.  We do not attempt to tune either model further, as these results are sufficient to show that it is possible to classify the articles based on information derived from their text.
+
+### Sentence-wise sentiment classification
+
+We train a Naive Bayes, Support Vector Machine and K-Nearest Neighbours algorithm on our train set, and attempt to use these algorithms to classify the probe set. We run these algorithms on three different sets of features:
+    i) the raw average sentiment scores for sentences mentioning the ALP and the Coalition.
+    ii) the date adjusted sentiment scores, which subtract the raw scored from the weekly average.
+    iii) a combination of the raw and date-adjusted sentiment scores
+    
+Table 4 summarises our results:
+```{r sentence sentiment classification and results}
+## First we create a set of dfs containing the features we will use for 
+## classification, and the column we are predicting, publication
+
+raw_analysis_train_data <- analysis_train %>% select(na_0_alp_sentiment, na_0_coalition_sentiment, publication)
+raw_analysis_probe_data <- analysis_probe %>% select(na_0_alp_sentiment, na_0_coalition_sentiment, publication)
+
+dated_analysis_train_data <- analysis_train %>% select(dated_alp_sentiment, dated_coalition_sentiment, publication)
+dated_analysis_probe_data <- analysis_probe %>% select(dated_alp_sentiment, dated_coalition_sentiment, publication)
+
+combined_analysis_train_data <- analysis_train %>% select(na_0_alp_sentiment, na_0_coalition_sentiment,
+                                                          dated_alp_sentiment, dated_coalition_sentiment, publication)
+combined_analysis_probe_data <- analysis_probe %>% select(na_0_alp_sentiment, na_0_coalition_sentiment,
+                                                          dated_alp_sentiment, dated_coalition_sentiment, publication)
+
+headings_analysis_train_data <- analysis_train %>% select(na_0_alp_sentiment, na_0_coalition_sentiment,
+                                                          #dated_alp_sentiment, dated_coalition_sentiment, 
+                                                          heading_sentiment, publication)
+headings_analysis_probe_data <- analysis_probe %>% select(na_0_alp_sentiment, na_0_coalition_sentiment,
+                                                          #dated_alp_sentiment, dated_coalition_sentiment, 
+                                                          heading_sentiment, publication)
+
+
+## SVM classification ##
+## We refer to https://rpubs.com/uky994/593668 tutorial on using SVM in caret
+## We leave trControl at its default setting as calculation speed is not an issue
+set.seed(25, sample.kind = "Rounding")
+sentiment_types <- c("raw", "dated", "combined", "headings")
+
+for(i in 1:length(sentiment_types)){
+  assign(paste("train_svm_linear", sentiment_types[i], sep = "_"), 
+         train(publication ~., data = eval(as.name(paste(sentiment_types[i], "analysis_train_data", sep = "_"))), 
+               method = "svmLinear", 
+               preProcess = c("center","scale"),
+               tuneGrid = expand.grid(C = seq(0.1, 1, length = 9))))
+}
+
+svm_models <- list(train_svm_linear_raw, train_svm_linear_dated, train_svm_linear_combined, train_svm_linear_headings)
+probe_sets <- list(raw_analysis_probe_data, dated_analysis_probe_data, combined_analysis_probe_data, headings_analysis_probe_data)
+
+for(i in 1:length(svm_models)){
+  assign(paste("svm_linear_accuracy", sentiment_types[i], sep = "_"),
+         confusionMatrix(predict(svm_models[[i]], probe_sets[[i]], type = "raw"),
+                         as.factor(probe_sets[[i]]$publication))$overall["Accuracy"] )
+}
+
+
+## KNN classification ##
+
+set.seed(25, sample.kind = "Rounding")
+for(i in 1:length(sentiment_types)){
+  assign(paste("train_knn", sentiment_types[i], sep = "_"), 
+         train(publication ~., data = eval(as.name(paste(sentiment_types[i], "analysis_train_data", sep = "_"))), 
+               method = "knn", 
+               tuneGrid = data.frame(k = seq(5, 31, 2))))
+}
+
+knn_models <- list(train_knn_raw, train_knn_dated, train_knn_combined, train_knn_headings)
+
+## accuracy
+for(i in 1:length(knn_models)){
+  assign(paste("knn_accuracy", sentiment_types[i], sep = "_"),
+         confusionMatrix(predict(knn_models[[i]], probe_sets[[i]], type = "raw"),
+                         as.factor(probe_sets[[i]]$publication))$overall["Accuracy"] )
+}
+
+
+
+## Naive Bayes classification ##
+set.seed(25, sample.kind = "Rounding")
+for(i in 1:length(sentiment_types)){
+  assign(paste("train_nb", sentiment_types[i], sep = "_"), 
+         train(publication ~., data = eval(as.name(paste(sentiment_types[i], "analysis_train_data", sep = "_"))), 
+               method = "naive_bayes",
+               tuneGrid = expand.grid(laplace = 0, usekernel = c(TRUE, FALSE), adjust = seq(0.5, 5, 0.5)),
+               usepoisson = TRUE))
+}
+
+nb_models <- list(train_nb_raw, train_nb_dated, train_nb_combined, train_nb_headings)
+
+## accuracy
+for(i in 1:length(nb_models)){
+  assign(paste("nb_accuracy", sentiment_types[i], sep = "_"),
+         confusionMatrix(predict(nb_models[[i]], probe_sets[[i]], type = "raw"),
+                         as.factor(probe_sets[[i]]$publication))$overall["Accuracy"] )
+}
+
+sentence_sentiment_results <- tibble(features = c("Raw sentiment scores", "Date-adjusted sentiment scores", "Combined"),
+                                     knn = c(knn_accuracy_raw, knn_accuracy_dated, knn_accuracy_combined), 
+                                     svm = c(svm_linear_accuracy_raw, svm_linear_accuracy_dated, svm_linear_accuracy_combined), 
+                                     nb = c(nb_accuracy_raw, nb_accuracy_dated, nb_accuracy_combined))
+
+sentence_sentiment_results %>% kbl(caption = "Prediction results using sentence sentiments", col.names = c("Features", "K-Nearest Neighbours", "Support Vector Machine", "Naive Bayes")) %>%  kable_paper("hover", full_width = F) %>% kable_styling(latex_options = "HOLD_position")
+```
+Only the K-Nearest Neighbours predictor performs better than the 'no information rate', and only modestly so. Observe that the Support Vector Machine and 
+Naive Bayes algorithms are very close to the no information rate. This is no accident - with the exception of Naive Bayes applied to the combined sentiment scores, these models are predicting *The Australian* for every article and so show its prevalence in the probe set.
+
+Data visualisation of our two features reveals why our classification algorithms perform so poorly. There is barely even partial separation between classes of the sort that would enable a decision boundary to be established between them (Figure 1). The contrast is clear if we compare this plot Irizarry (2022) uses to illustrate multi-class classification, where for instance there is perfect separation in the proportion of different fatty acids in olive oil produced in different regions of Italy, enabling 100 % accuracy in classification.
+
+```{r overlapping features}
+analysis_train %>%  
+  ggplot(aes(na_0_alp_sentiment, na_0_coalition_sentiment, colour = publication)) +
+  geom_point(shape = "bullet") + 
+  labs(x = "Sentiment scores - ALP sentences", y = "Sentiment scores - Coalition sentences") +
+  scale_color_manual(values = pub_colours) +
+  ggtitle("Figure 1: Distribution of Articles by Sentiment Scores") +
+  theme(plot.title=element_text(size=12))
+```
+
+This distribution persists even when we divide our sentiment data into six date bins spanning the six weeks of the campaign, explaining why the addition of date-adjusted sentiment data does not add predictive power to our algorithms. These visualisations suggest that rather than further tuning of our algorithms or a search for more sophisticated classification algorithms, different or additional features are required to further investigate the feasibility of classifying the articles based on political bias (Figure 2).^[As a further test of this conclusion, we trialled a polynomial SVM algorithm and a random forest algorithm on the raw sentiment scores. As results were not superior to the algorithms presented here, we did not attempt refinement of these algorithms. Code is presented in the accompanying R script.]
+
+```{r overlapping features data bins}
+analysis_train %>%  
+  ggplot(aes(na_0_alp_sentiment, na_0_coalition_sentiment, colour = publication)) +
+  geom_point(shape = "bullet") + 
+  scale_color_manual(values = pub_colours) +
+  labs(x = "Sentiment scores - ALP sentences", y = "Sentiment scores - Coalition sentences") +
+  facet_wrap(~date_bins) +
+  ggtitle("Figure 2: Distribution of Articles by Sentiment Scores, by Week of Campaign") +
+  theme(plot.title=element_text(size=12))
+```
+
+
+### Adding headline sentiment to classification
+We next add the sentiment score for headlines as an additional predictor, and rerun our algorithms. As the raw sentiment scores perform the best of our three sentence sentiment measures, we combine the headings as a third predictor with our raw sentence sentiment scores. The addition of the headline sentiments does not improve model performance for any of our algorithms.
+
+```{r headline sentiment scores}
+with_headline_sentiment_results <- tibble(features = c("Raw sentiment scores", "Date-adjusted sentiment scores", 
+                                                       "Combined", "Headlines"),
+                                     knn = c(knn_accuracy_raw, knn_accuracy_dated, knn_accuracy_combined, knn_accuracy_headings), 
+                                     svm = c(svm_linear_accuracy_raw, svm_linear_accuracy_dated, svm_linear_accuracy_combined, svm_linear_accuracy_headings), 
+                                     nb = c(nb_accuracy_raw, nb_accuracy_dated, nb_accuracy_combined, nb_accuracy_headings))
+
+with_headline_sentiment_results %>% kbl(caption = "Prediction results using headline sentiments", col.names = c("Features", "K-Nearest Neighbours", "Support Vector Machine", "Naive Bayes")) %>%  kable_paper("hover", full_width = F) %>% kable_styling(latex_options = "HOLD_position") %>% row_spec(4, bold = TRUE)
+```
+
+
+Similar to the previous sub-section, a boxplot suggests why the headings are not adding predictive power. Although there are some outliers, we again see substantial overlap in scores between different publications (Figure 3).
+```{r headline sentiment boxplot}
+analysis_train %>% 
+  ggplot(aes(publication, heading_sentiment)) +
+  geom_boxplot() +
+  labs(x = "Publication outlet", y = "Headline sentiment scores") +
+  ggtitle("Figure 3: Distribution of Articles by Headline Sentiment Scores") +
+  theme(plot.title=element_text(size=12))
+```
+
+
+### Sentence text classification
+Our final - and least direct - measure of political bias is to perform full text classification on the sentences that we have identified as discussing the ALP and the Coalition. We produce three different datasets by collapsing all of the political sentences from each document into a single text:
+
+  i)  ALP corpus - only the sentences coded as mentioning the ALP are included
+  ii) Coalition corpus - only the sentences coded as mentioning the Coalition are included
+  iii) Political sentences corpus - all sentences coded either as mentioning the ALP and the Coalition are included.
+    
+For (i) and (ii) respectively, we are forced to remove 37 documents from our dataset which do not contain any sentences coded as mentioning the ALP,  and 17 documents with no sentences mentioning the Coalition. We again use the Support Vector Machine and Naive Bayes classifiers implemented through quanteda.textmodels, and achieve accuracy well above our sentiment-based classification, although somewhat below the full articles text scores.
+```{r text of political sentences classification}
+# We use the alp_composite, coalition_composite and pol_composite columns of 
+# analysis_df, which are the text of all ALP, Coalition and ALP+Coalition
+# sentences in each document collapsed into a single string.
+# Now create dfms for the ALP, Coalition and all political sentences
+# Note - quanteda will replace the NAs with empty strings where there are no
+# ALP or Coalition sentences in a particular document, so we first need to 
+# generate lists of NAs for alp and Coalition to subset those dfms
+alp_composite_NAs <- analysis_df %>% filter(is.na(alp_composite)) %>% pull(doc_id)
+coalition_composite_NAs <- analysis_df %>% filter(is.na(coalition_composite)) %>% pull(doc_id)
+
+
+# we now create the dfms
+pol_groups <- c("alp", "coalition", "pol")
+pol_groups_list <- list(analysis_df$alp_composite, analysis_df$coalition_composite, analysis_df$pol_composite)
+
+for(i in 1:length(pol_groups)){
+  assign(paste(pol_groups[i], "_dfm", sep = ""), corpus(pol_groups_list[[i]], 
+                                                        docnames = analysis_df$doc_id, 
+                                                        docvars = data.frame(publication = analysis_df$publication)) %>% 
+  tokens(., remove_punct = TRUE) %>% 
+  tokens_select(., pattern = stopwords("en"), selection = "remove", padding = TRUE) %>% 
+  tokens_select(., pattern = pub_names, selection = "remove", padding = TRUE) %>% dfm())
+}
+
+# Now subset each of three dfms into train, probe, validation
+pol_dfm_names <- c("alp_dfm", "coalition_dfm", "pol_dfm")
+pol_dfm_list <- list(alp_dfm, coalition_dfm, pol_dfm)
+sets_doc_ids_list <- list(train_doc_ids, probe_doc_ids, test_doc_ids, train_full_doc_ids)
+
+for(i in 1:length(pol_dfm_list)){
+  for(j in 1:length(sets)){
+  assign(paste(pol_dfm_names[i], sets[j], sep = "_"), pol_dfm_list[[i]] %>% dfm_subset(., docnames(pol_dfm_list[[i]]) %in% sets_doc_ids_list[[j]]))
+}}
+
+## we also need to remove the docs for which quanteda replaced NAs with empty strings,
+## as we cannot expect to have any predictive capacity for these docs
+
+alp_dfm_list <- list(alp_dfm_train, alp_dfm_probe, alp_dfm_test, alp_dfm_train_full)
+for(i in 1:length(alp_dfm_list)){
+  alp_dfm_list[[i]] <- alp_dfm_list[[i]] %>% dfm_subset(., !docnames(alp_dfm_list[[i]]) %in% alp_composite_NAs)}
+
+coalition_dfm_list <- list(coalition_dfm_train, coalition_dfm_probe, coalition_dfm_test, coalition_dfm_train_full)
+for(i in 1:length(coalition_dfm_list)){
+  coalition_dfm_list[[i]] <- coalition_dfm_list[[i]] %>% dfm_subset(., !docnames(coalition_dfm_list[[i]]) %in% coalition_composite_NAs)
+}
+
+## Using only features in train set, then padding probe set plus removing features not in train
+train_set_dfm_list <- list(alp_dfm_train, coalition_dfm_train, pol_dfm_train)
+for(i in 1:length(train_set_dfm_list)){
+  train_set_dfm_list[[i]] <- train_set_dfm_list[[i]] %>% dfm_trim(1)
+}
+
+probe_set_dfm_list <- list(alp_dfm_probe, coalition_dfm_probe, pol_dfm_probe)
+for(i in 1:length(probe_set_dfm_list)){
+  probe_set_dfm_list[[i]] <- dfm_match(probe_set_dfm_list[[i]], featnames(train_set_dfm_list[[i]]))
+}
+
+## we first run the quanteda_textplots on train and probe
+## The lists and groups do not need to be rerun, I have pasted them here as a reminder 
+## of what the for loop is looping over 
+  # train_set_dfm_list <- list(alp_dfm_train, coalition_dfm_train, pol_dfm_train)
+  # probe_set_dfm_list <- list(alp_dfm_probe, coalition_dfm_probe, pol_dfm_probe)
+  # pol_groups <- c("alp", "coalition", "pol")
+
+## SVM - Output model, predictions and accuracy for ALP, Coalition and Political Sentences DFM
+set.seed(25, sample.kind = "Rounding")
+for(i in 1:length(train_set_dfm_list)){
+  assign(paste("svm_model_comp", pol_groups[i], sep = "_"), textmodel_svm(train_set_dfm_list[[i]], docvars(train_set_dfm_list[[i]], "publication")))
+  assign(paste("test_predictions_svm_comp", pol_groups[i], sep = "_"), predict(eval(as.name(paste("svm_model_comp", pol_groups[i], sep = "_"))), 
+                                                                      newdata = probe_set_dfm_list[[i]]))
+  assign(paste("accuracy_svm_comp", pol_groups[i], sep = "_"), 
+         confusionMatrix(as.factor(docvars(probe_set_dfm_list[[i]], "publication")),
+        as.factor(eval(as.name(paste("test_predictions_svm_comp", pol_groups[i], sep = "_")))))$overall["Accuracy"])
+}
+
+## NB - Output model, predictions and accuracy for ALP, Coalition and Political Sentences DFM
+set.seed(25, sample.kind = "Rounding")
+for(i in 1:length(train_set_dfm_list)){
+  assign(paste("nb_model_comp", pol_groups[i], sep = "_"), textmodel_nb(train_set_dfm_list[[i]], docvars(train_set_dfm_list[[i]], "publication")))
+  assign(paste("test_predictions_nb_comp", pol_groups[i], sep = "_"), predict(eval(as.name(paste("nb_model_comp", pol_groups[i], sep = "_"))), 
+                                                                      newdata = probe_set_dfm_list[[i]]))
+  assign(paste("accuracy_nb_comp", pol_groups[i], sep = "_"), 
+         confusionMatrix(as.factor(docvars(probe_set_dfm_list[[i]], "publication")),
+                         as.factor(eval(as.name(paste("test_predictions_nb_comp", pol_groups[i], sep = "_")))))$overall["Accuracy"])
+}
+
+## NB priors model - no clear difference, but these all perfrom somewhat above no information rate
+set.seed(25, sample.kind = "Rounding")
+for(i in 1:length(train_set_dfm_list)){
+  assign(paste("nb_priors_model_comp", pol_groups[i], sep = "_"), textmodel_nb(train_set_dfm_list[[i]], docvars(train_set_dfm_list[[i]], "publication"), 
+                                                                          prior = "docfreq"))
+  assign(paste("test_predictions_nb_priors_comp", pol_groups[i], sep = "_"), predict(eval(as.name(paste("nb_priors_model_comp", pol_groups[i], sep = "_"))), 
+                                                                         newdata = probe_set_dfm_list[[i]]))
+  assign(paste("accuracy_nb_priors", pol_groups[i], sep = "_"), 
+         confusionMatrix(as.factor(docvars(probe_set_dfm_list[[i]], "publication")),
+                         as.factor(eval(as.name(paste("test_predictions_nb_priors_comp", pol_groups[i], sep = "_")))))$overall["Accuracy"])
+}
+
+pol_sentence_results <- tibble(features = c("ALP sentences", "Coalition sentences", 
+                                                       "ALP and Coalition Sentences"),
+                                    svm = c(accuracy_svm_comp_alp, accuracy_svm_comp_coalition, accuracy_svm_comp_pol), 
+                                     nb = c(accuracy_nb_comp_alp, accuracy_nb_comp_coalition, accuracy_nb_comp_pol),
+                               nb_prior = c(accuracy_nb_priors_alp, accuracy_nb_priors_coalition, accuracy_nb_priors_pol))
+
+pol_sentence_results %>% kbl(caption = "Prediction results using text of political sentences", col.names = c("Features", "Support Vector Machine", "Naive Bayes", "Naive Bayes Adjusted for Prevalence")) %>%  kable_paper("hover", full_width = F) %>% kable_styling(latex_options = "HOLD_position") 
+```
+
+### Final model
+```{r final model}
+set.seed(25, sample.kind = "Rounding")
+final_svm_model <-  textmodel_svm(pol_dfm_train_full, docvars(pol_dfm_train_full, "publication"))
+
+test_predictions_final_svm <- predict(final_svm_model,
+                                   newdata=pol_dfm_test)
+
+## Calculate accuracy metric for this classification effort
+
+final_svm_accuracy <- confusionMatrix(as.factor(docvars(pol_dfm_test,"publication")),
+                                          as.factor(test_predictions_final_svm))$overall["Accuracy"]
+```
+Of the various models we have tested on the probe set, the best performed are our three algorithms trained on the text of sentences mentioning the ALP and/or the Coalition. This presents us with the option of using an ensemble of the three algorithms, or simply selecting the Support Vector Machine as the best performing individual algorithm. Inspection of the actual predictions of Naive Bayes and the adjusted Naive Bayes algorithm makes it clear that an ensemble is inappropriate. The predictions of these two algorithms differ in only one instance, meaning they would outvote the SVM algorithm despite having inferior accuracy.^[Predictions are not listed here, but code to produce them is provided in the accompanying R script] We hence train the SVM algorithm on the full train set, and test it on our test set. Our final classification accuracy is `r round(final_svm_accuracy, digits = 3)*100`%.
+
+In lieu of a formal measure of feature importance, we use quanteda.textplot's textplot_keyness function to visualise which words tend to occur more in each publications compared to the other four.^[https://tutorials.quanteda.io/statistical-analysis/keyness/] In the plots below, the blue columns at the top of each plot indicate words that are more likely to appear in the designated publication, whereas the grey columns are words that are more likely to appear in the others. Using this proxy measure, we see little evidence that these words are direct measures of bias. Many are entities (names) or nouns.
+
+```{r keyness plots }
+knitr::opts_chunk$set(fig.height = 4, out.height = "50%")
+abc_keyness <- textstat_keyness(pol_dfm_train_full, 
+                 target = pol_dfm_train_full$publication == "ABC News")
+guardian_keyness <- textstat_keyness(pol_dfm_train_full, 
+                                     target = pol_dfm_train_full$publication == "Guardian Australia")
+australian_keyness <- textstat_keyness(pol_dfm_train_full, 
+                                       target = pol_dfm_train_full$publication == "The Australian")
+theage_keyness <- textstat_keyness(pol_dfm_train_full, 
+                                   target = pol_dfm_train_full$publication == "The Age")
+heraldsun_keyness <- textstat_keyness(pol_dfm_train_full, 
+                                      target = pol_dfm_train_full$publication == "Herald Sun")
+
+p1 <- textplot_keyness(abc_keyness, show_legend = FALSE, labelsize = 3) + ggtitle("ABC News") +
+  theme(plot.title=element_text(size=12))
+p2 <- textplot_keyness(guardian_keyness, show_legend = FALSE, labelsize = 3)+ ggtitle("Guardian Australia") +
+  theme(plot.title=element_text(size=12))
+p3 <- textplot_keyness(australian_keyness, show_legend = FALSE, labelsize = 3) + ggtitle("The Australian") +
+  theme(plot.title=element_text(size=12))
+p4 <- textplot_keyness(theage_keyness, show_legend = FALSE, labelsize = 3) + ggtitle("The Age") +
+  theme(plot.title=element_text(size=12))
+p5 <- textplot_keyness(heraldsun_keyness, show_legend = FALSE, labelsize = 3) + ggtitle("Herald Sun") +
+  theme(plot.title=element_text(size=12))
+
+p1
+p2
+p3
+p4
+p5
+```
+
+
+## Conclusion
+These results leave us with an ambiguous conclusion. It is clearly possible to use machine learning techniques on the text of articles discussing the federal election to identify their publication outlet. The Support Vector Machine algorithm performs very well in classifying articles - far above the 'no information rate' - even based just on the sentences we identify as mentioning the ALP and/or Coalition. Without the ability using the quanteda.textmodels package to extract the most important features, however, we remain unsure whether this classification reflects differing biases between publications or some other systematic difference in these outlets' use of language. Identifying or developing a method to extract these features from quanteda.textmodels, or re-implementing the algorithms using a different package that would enable feature extraction, is one area for further work.
+
+Equally, the modest performance of our sentiment-based measures does not support a definitive conclusion regarding bias. It may be that perceptions of distinctive political bias on the part of these media outlets are overstated. Equally, though, further work on developing better features may yield clearer results. This might include using other packages or approaches to generate sentiment scores, or developing a different computational measure of the political stance of each text. More likely, in the author's estimation, some combination of manual coding and computational measures may be needed to generate better features to enable classification based on political bias.
+
+## References
+
+Gans, Joshua S. and Leigh, Andrew. 2012. 'How Partisan is the Press? Multiple Measures of Media Slant'. *The Economic Record*, 88(280): 127–147. <http://andrewleigh.org/pdf/MediaSlant.pdf>
+
+Irizarry, Rafael A. 2022. *Introduction to Data Science: Data Analysis and Prediction Algorithms with R* <https://rafalab.github.io/dsbook/>
+
+Kuhn, Max and Johnson, Kjell. 2016. *Applied Predictive Modelling*. Springer: New York. <https://link.springer.com/book/10.1007/978-1-4614-6849-3>
+
+Naldi, Maurizio. 2019. *A review of sentiment computation methods with R packages*. arXiv eprint. <https://doi.org/10.48550/arXiv.1901.08319>
